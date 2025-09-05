@@ -1,0 +1,314 @@
+---
+- name: Ensure user/group exist (if different from login user)
+  ansible.builtin.user:
+    name: "{{ factorio_user }}"
+    state: present
+  when: factorio_user not in ["root", ansible_user]
+
+- name: Ensure base packages
+  ansible.builtin.package:
+    name:
+      - xz-utils
+      - tar
+    state: present
+  when: ansible_facts.os_family == "Debian"
+
+- name: Ensure base packages (RHEL family)
+  ansible.builtin.package:
+    name:
+      - xz
+      - tar
+    state: present
+  when: ansible_facts.os_family == "RedHat"
+
+- name: Create install and data directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+    mode: "0755"
+  loop:
+    - "{{ install_dir }}"
+    - "{{ data_dir }}"
+    - "{{ data_dir }}/saves"
+    - "{{ data_dir }}/mods"
+    - "{{ data_dir }}/config"
+    - "{{ data_dir }}/script-output"
+    - "{{ data_dir }}/logs"
+
+- name: Upload & extract Factorio tarball
+  ansible.builtin.unarchive:
+    src: "{{ factorio_tarball_local }}"
+    dest: "{{ install_dir }}"
+    remote_src: false
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+    extra_opts:
+      - "--strip-components=1"
+    creates: "{{ install_dir }}/bin/x64/factorio"
+
+- name: Fix ownership on install tree
+  ansible.builtin.file:
+    path: "{{ install_dir }}"
+    state: directory
+    recurse: true
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+
+- name: Render config.ini
+  ansible.builtin.template:
+    src: config.ini.j2
+    dest: "{{ data_dir }}/config/config.ini"
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+    mode: "0644"
+
+- name: Render server-settings.json
+  ansible.builtin.template:
+    src: server-settings.json.j2
+    dest: "{{ data_dir }}/config/server-settings.json"
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+    mode: "0644"
+
+# Build a normalized list of instances with defaults and generated RCON passwords
+- name: Normalize instances list
+  ansible.builtin.set_fact:
+    _instances_normalized: []
+
+- name: Expand instances with defaults
+  ansible.builtin.set_fact:
+    _instances_normalized: "{{ _instances_normalized + [_instance_dict] }}"
+  vars:
+    _instance_dict:
+      name: "{{ item.name }}"
+      save_name: "{{ item.save_name | default(item.name + '.zip') }}"
+      seed: "{{ item.seed | default(factorio_seed) }}"
+      port: "{{ item.port | default(game_port_base + idx) }}"
+      rcon_port: "{{ item.rcon_port | default(rcon_port_base + idx) }}"
+      rcon_password: >-
+        {{ item.rcon_password | default(
+          lookup(
+            'password',
+            playbook_dir + '/.factorio_rcon_' + item.name + ' length=24 chars=ascii_letters,digits'
+          )
+        ) }}
+  loop: "{{ factorio_instances }}"
+  loop_control:
+    index_var: idx
+
+- name: Validate unique game ports across instances
+  ansible.builtin.assert:
+    that:
+      - (_instances_normalized | map(attribute='port') | list | unique | length) == (_instances_normalized | map(attribute='port') | list | length)
+    fail_msg: "Duplicate game ports detected among instances: {{ _instances_normalized | map(attribute='name') | list }}"
+
+- name: Validate unique RCON ports across instances
+  ansible.builtin.assert:
+    that:
+      - (_instances_normalized | map(attribute='rcon_port') | list | unique | length) == (_instances_normalized | map(attribute='rcon_port') | list | length)
+    fail_msg: "Duplicate RCON ports detected among instances: {{ _instances_normalized | map(attribute='name') | list }}"
+
+- name: Create initial saves (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      {{ install_dir }}/bin/x64/factorio
+      -c {{ data_dir }}/config/config.ini
+      --mod-directory {{ data_dir }}/mods
+      --create {{ data_dir }}/saves/{{ item.save_name }}
+      --map-gen-seed {{ item.seed }}
+  args:
+    creates: "{{ data_dir }}/saves/{{ item.save_name }}"
+  become: true
+  become_user: "{{ factorio_user }}"
+  loop: "{{ _instances_normalized }}"
+
+# Surface/store RCON credentials per instance (readable by factorio user only)
+- name: Write RCON credentials summary
+  ansible.builtin.copy:
+    dest: "{{ data_dir }}/config/rcon-credentials.json"
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+    mode: "0600"
+    content: |
+      {
+        "instances": [
+        {%- for i in _instances_normalized -%}
+          {
+            "name": "{{ i.name }}",
+            "port": {{ i.port }},
+            "rcon_port": {{ i.rcon_port }},
+            "rcon_password": "{{ i.rcon_password }}"
+          }{% if not loop.last %},{% endif %}
+        {%- endfor -%}
+        ]
+      }
+
+# --- MODS FROM CONTROLLER (optional) ------------------------------------------
+- name: Ensure required local Agent mod zip exists on controller
+  when:
+    - use_local_mod_zips | bool
+    - require_agent_mod_local | bool
+  delegate_to: localhost
+  ansible.builtin.find:
+    paths: "{{ mods_local_dir }}"
+    patterns: "Factorio-AI-agent_*.zip"
+    file_type: file
+  run_once: true
+  register: agent_zip_check
+
+- name: Ensure Agent mod zip present (assert)
+  when:
+    - use_local_mod_zips | bool
+    - require_agent_mod_local | bool
+  ansible.builtin.assert:
+    that:
+      - (agent_zip_check.files | length) > 0
+    fail_msg: "Required mod zip not found: {{ mods_local_dir }}/Factorio-AI-agent_*.zip"
+
+- name: Copy local mod zips to server
+  when: use_local_mod_zips | bool
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ data_dir }}/mods/{{ item | basename }}"
+    mode: "0644"
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+  with_fileglob:
+    - "{{ mods_local_dir }}/*.zip"
+
+# --- MODS FROM MOD PORTAL (optional) -----------------------------------------
+- name: Query Mod Portal metadata
+  when:
+    - download_mods | bool
+    - (mods_enabled | length) > 0
+  ansible.builtin.uri:
+    url: "https://mods.factorio.com/api/mods/{{ item }}/full"
+    method: GET
+    return_content: true
+    status_code: 200
+  loop: "{{ mods_enabled }}"
+  register: mod_portal_meta
+
+- name: Download mod releases
+  when:
+    - download_mods | bool
+    - (mods_enabled | length) > 0
+  vars:
+    releases: "{{ item.json.releases | default([]) }}"
+    preferred: "{{ releases | selectattr('info_json.factorio_version', 'search', '^' + prefer_factorio_major) | list }}"
+    chosen: "{{ (preferred | length > 0) | ternary(preferred, releases) | sort(attribute='version') | last }}"
+    file_name: "{{ chosen.file_name }}"
+    dest_path: "{{ data_dir }}/mods/{{ file_name }}"
+    base_url: "https://mods.factorio.com{{ chosen.download_url }}"
+    url: >-
+      {{ base_url }}{{ (factorio_mod_portal_username is defined and factorio_mod_portal_token is defined) |
+      ternary('?username=' + factorio_mod_portal_username + '&token=' + factorio_mod_portal_token, '') }}
+  ansible.builtin.get_url:
+    url: "{{ url }}"
+    dest: "{{ dest_path }}"
+    mode: "0644"
+  loop: "{{ mod_portal_meta.results | default([]) }}"
+  loop_control:
+    label: "{{ item.json.name | default('unknown') }} -> {{ file_name | default('n/a') }}"
+
+# --- DISCOVER INSTALLED ZIPS ON SERVER ----------------------------------------
+- name: List mod zip files on server
+  ansible.builtin.find:
+    paths: "{{ data_dir }}/mods"
+    patterns: "*.zip"
+    file_type: file
+  register: mods_found
+
+- name: Extract mod names from zip filenames
+  ansible.builtin.set_fact:
+    zipped_mod_names: "{{ mods_found.files | map(attribute='path') | map('basename') | map('regex_replace', '_(\\d+\\..*)\\.zip$', '') | list | unique }}"
+
+# --- RENDER mod-list.json FROM DISCOVERED MODS --------------------------------
+- name: Render mod-list.json (enable base + all discovered zips)
+  ansible.builtin.copy:
+    dest: "{{ data_dir }}/mods/mod-list.json"
+    owner: "{{ factorio_user }}"
+    group: "{{ factorio_group }}"
+    mode: "0644"
+    content: |
+      {
+        "mods": [
+          { "name": "base", "enabled": true }
+          {% for m in zipped_mod_names %}
+          ,{ "name": "{{ m }}", "enabled": true }
+          {% endfor %}
+        ]
+      }
+  notify:
+    - restart factorio units
+
+
+# Systemd units per instance
+- name: Render systemd unit per instance
+  ansible.builtin.template:
+    src: factorio-unit.j2
+    dest: "/etc/systemd/system/factorio-{{ item.name }}.service"
+    mode: "0644"
+  vars:
+    instance: "{{ item }}"
+  loop: "{{ _instances_normalized }}"
+  notify:
+    - daemon-reload
+
+- name: Enable & start all units
+  ansible.builtin.systemd:
+    name: "factorio-{{ item.name }}.service"
+    state: started
+    enabled: true
+  loop: "{{ _instances_normalized }}"
+
+- name: Set a fact with unit names (for handler restarts later)
+  ansible.builtin.set_fact:
+    factorio_units: "{{ _instances_normalized | map(attribute='name') | map('regex_replace', '^', 'factorio-') | map('regex_replace', '$', '.service') | list }}"
+
+# --- OPTIONAL FIREWALL (UFW) --------------------------------------------------
+- name: Install ufw (Debian family)
+  when: ufw_manage | bool and ansible_facts.os_family == "Debian"
+  ansible.builtin.package:
+    name: ufw
+    state: present
+
+- name: Apply UFW rules for game UDP ports
+  when: ufw_manage | bool
+  community.general.ufw:
+    rule: allow
+    proto: udp
+    port: "{{ item.port }}"
+    comment: "Factorio {{ item.name }} game"
+  loop: "{{ _instances_normalized }}"
+
+- name: Apply UFW rules for RCON TCP ports
+  when: ufw_manage | bool
+  community.general.ufw:
+    rule: allow
+    proto: tcp
+    port: "{{ item.rcon_port }}"
+    comment: "Factorio {{ item.name }} rcon"
+  loop: "{{ _instances_normalized }}"
+
+- name: Ensure UFW state
+  when: ufw_manage | bool and ufw_enable | bool
+  community.general.ufw:
+    state: enabled
+    policy: "{{ ufw_default_policy }}"
+
+# --- OPTIONAL LOGROTATE -------------------------------------------------------
+- name: Install logrotate package
+  when: logrotate_manage | bool
+  ansible.builtin.package:
+    name: logrotate
+    state: present
+
+- name: Configure logrotate for Factorio
+  when: logrotate_manage | bool
+  ansible.builtin.template:
+    src: factorio-logrotate.j2
+    dest: /etc/logrotate.d/factorio
+    mode: "0644"

@@ -1,0 +1,169 @@
+---
+- name: Build and deploy Factorio AI agent mod
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Inputs (override via -e):
+    agent_source_dir: "{{ playbook_dir | dirname }}/mods/Factorio-AI-agent"  # default; will auto-detect if empty
+    agent_version: ""         # if empty, bump patch from info.json
+    mods_output_dir: "{{ playbook_dir }}/files/mods"
+
+  tasks:
+    - name: Auto-detect agent source dir when not provided
+      when: agent_source_dir | length == 0
+      vars:
+        mods_dir: "{{ playbook_dir | dirname }}/mods"
+      ansible.builtin.find:
+        paths: "{{ mods_dir }}"
+        patterns: "Factorio-AI-agent_*"
+        file_type: directory
+      register: agent_src_dirs
+
+    - name: Choose newest agent source dir
+      when: agent_source_dir | length == 0
+      ansible.builtin.set_fact:
+        agent_source_dir: "{{ (agent_src_dirs.files | sort(attribute='mtime', reverse=true) | first).path }}"
+
+    - name: Read info.json
+      ansible.builtin.slurp:
+        src: "{{ agent_source_dir }}/info.json"
+      register: info_json_raw
+
+    - name: Parse info.json
+      ansible.builtin.set_fact:
+        agent_info: "{{ info_json_raw.content | b64decode | from_json }}"
+
+    - name: Compute new version (use provided or bump patch)
+      ansible.builtin.set_fact:
+        agent_version_new: >-
+          {{
+            agent_version | default(
+              (agent_info.version.split('.')[0] | int | string)
+              ~ '.' ~
+              (agent_info.version.split('.')[1] | int | string)
+              ~ '.' ~
+              (((agent_info.version.split('.')[2] | int) + 1) | string),
+              true)
+          }}
+
+    - name: Update info.json with new version (idempotent)
+      when: agent_info.version != agent_version_new
+      vars:
+        updated: "{{ agent_info | combine({'version': agent_version_new}) }}"
+      ansible.builtin.copy:
+        dest: "{{ agent_source_dir }}/info.json"
+        content: "{{ updated | to_nice_json }}\n"
+        mode: "0644"
+
+    - name: Ensure mods output dir exists
+      ansible.builtin.file:
+        path: "{{ mods_output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Package mod using helper script
+      ansible.builtin.command:
+        cmd: "{{ playbook_dir | dirname }}/Tools/package_mod.sh --source '{{ agent_source_dir }}'"
+      register: pkg_result
+      changed_when: "'Packaged:' in pkg_result.stdout or 'Packaged:' in pkg_result.stderr"
+
+    - name: Determine zip name from updated info.json
+      ansible.builtin.set_fact:
+        agent_zip_name: "{{ agent_info.name }}_{{ agent_version_new }}.zip"
+
+    - name: Determine zip path
+      ansible.builtin.set_fact:
+        agent_zip_path: "{{ mods_output_dir }}/{{ agent_zip_name }}"
+
+- name: Deploy agent mod to servers and restart instances
+  hosts: ceres.coloweb.be
+  become: true
+  gather_facts: false
+
+  vars:
+    # Inputs: provide a JSON list e.g. -e 'agent_instances=["ai1","ai2"]'
+    agent_instances: []
+    data_dir: "/srv/factorio"
+    factorio_user: "tripkipke"
+    factorio_group: "tripkipke"
+    mods_output_dir: "{{ playbook_dir }}/files/mods"
+    # These are set in the first play via set_stats
+
+  pre_tasks:
+    - name: Normalize agent_instances when a proper list is provided
+      when: agent_instances is sequence and (agent_instances is not string)
+      ansible.builtin.set_fact:
+        agent_instances_list: "{{ agent_instances | list }}"
+
+    - name: Normalize agent_instances when a string is provided (JSON-like [..])
+      when: agent_instances is string and (agent_instances | trim) is match('^\[')
+      ansible.builtin.set_fact:
+        agent_instances_list: >-
+          {{ agent_instances
+             | trim
+             | regex_replace('^\[|\]$', '')
+             | regex_replace('"', '')
+             | regex_replace("'", '')
+             | split(',')
+             | map('trim')
+             | reject('equalto', '')
+             | list }}
+
+    - name: Normalize agent_instances when a comma-separated string is provided
+      when: agent_instances is string and not ((agent_instances | trim) is match('^\['))
+      ansible.builtin.set_fact:
+        agent_instances_list: "{{ agent_instances | split(',') | map('trim') | reject('equalto','') | list }}"
+
+    - name: Ensure agent_instances_list is defined
+      when: agent_instances_list is not defined
+      ansible.builtin.set_fact:
+        agent_instances_list: []
+
+    - name: Set a fact with agent zip details from localhost
+      ansible.builtin.set_fact:
+        agent_zip_name: "{{ hostvars['localhost']['agent_zip_name'] }}"
+        agent_zip_path: "{{ hostvars['localhost']['agent_zip_path'] }}"
+
+  tasks:
+    - name: Ensure remote mods dir exists
+      ansible.builtin.file:
+        path: "{{ data_dir }}/mods"
+        state: directory
+        owner: "{{ factorio_user }}"
+        group: "{{ factorio_group }}"
+        mode: "0755"
+
+    - name: Upload agent mod zip
+      ansible.builtin.copy:
+        src: "{{ agent_zip_path }}"
+        dest: "{{ data_dir }}/mods/{{ agent_zip_name }}"
+        owner: "{{ factorio_user }}"
+        group: "{{ factorio_group }}"
+        mode: "0644"
+
+    - name: Remove older agent mod zips (keep the uploaded one)
+      ansible.builtin.find:
+        paths: "{{ data_dir }}/mods"
+        patterns: "Factorio-AI-agent_*.zip"
+        file_type: file
+      register: agent_zips
+
+    - name: Delete old agent zips
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ agent_zips.files | selectattr('path', '!=', data_dir + '/mods/' + agent_zip_name) | list }}"
+
+    - name: Restart selected instances
+      when: agent_instances_list | length > 0
+      ansible.builtin.systemd:
+        name: "factorio-{{ item }}.service"
+        state: restarted
+        enabled: true
+      loop: "{{ agent_instances_list }}"
+
+    - name: Info when no instances provided
+      when: agent_instances_list | length == 0
+      ansible.builtin.debug:
+        msg: "agent_instances not provided; uploaded zip but did not restart any units"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Factorio Headless Server ({{ instance.name }})
+After=network.target
+
+[Service]
+Type=simple
+User={{ factorio_user }}
+Group={{ factorio_group }}
+WorkingDirectory={{ data_dir }}
+ExecStart={{ install_dir }}/bin/x64/factorio -c {{ data_dir }}/config/config.ini --mod-directory {{ data_dir }}/mods --start-server {{ data_dir }}/saves/{{ instance.save_name }} --server-settings {{ data_dir }}/config/server-settings.json --port {{ instance.port }} --rcon-port {{ instance.rcon_port }} --rcon-password {{ instance.rcon_password }}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

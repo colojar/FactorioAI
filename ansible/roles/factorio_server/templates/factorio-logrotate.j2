@@ -1,0 +1,20 @@
+# Logrotate policy for Factorio logs and script-output
+# Adjust periods/rotate with vars: logrotate_period, logrotate_rotate
+{{ data_dir }}/logs/*.log {
+  {{ logrotate_period }}
+  rotate {{ logrotate_rotate }}
+  missingok
+  compress
+  delaycompress
+  notifempty
+  copytruncate
+}
+{{ data_dir }}/script-output/*.json {{ data_dir }}/script-output/*/*.json {
+  {{ logrotate_period }}
+  rotate {{ logrotate_rotate }}
+  missingok
+  compress
+  delaycompress
+  notifempty
+  copytruncate
+}

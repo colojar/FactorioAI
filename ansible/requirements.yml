@@ -1,0 +1,6 @@
+---
+# Declare external dependencies to install with:
+#   ansible-galaxy install -r requirements.yml
+collections:
+  - name: community.general
+roles: []

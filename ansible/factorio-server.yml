@@ -1,0 +1,55 @@
+---
+- name: Deploy Factorio headless server(s)
+  hosts: ceres.coloweb.be
+  become: true
+
+  # Optional: store your Mod Portal creds here; not committed to git
+  vars_files:
+    - .secrets/factorio.yml   # contains factorio_mod_portal_username/token
+
+  vars:
+    # Use the tarball you checked in under ansible/files/
+    factorio_tarball_local: "{{ playbook_dir }}/files/factorio-headless_linux_2.0.60.tar.xz"
+
+    # Server/service basics
+    factorio_version: "2.0.60"
+    factorio_user: "tripkipke"
+    factorio_group: "tripkipke"
+    install_dir: "/opt/factorio"
+    data_dir: "/srv/factorio"
+
+    # World + ports
+    factorio_seed: "0627218724"
+    game_port_base: 34197
+    rcon_port_base: 27015
+
+    # —— Mods policy ——
+    # Always copy any local mod zips found here (we REQUIRE the Factorio-AI-agent_0.0.1 zip here)
+    use_local_mod_zips: true
+    mods_local_dir: "{{ playbook_dir }}/files/mods"
+
+    # Also keep Mod Portal downloads enabled (for non-Factorio-AI-agent_0.0.1 mods)
+    download_mods: true
+    prefer_factorio_major: "2."   # prefer 2.x releases where available
+
+    # Mods to download (do NOT include 'Factorio-AI-agent_0.0.1' here—it's provided locally)
+    mods_enabled:
+      - even-distribution
+      - GhostScanner4
+      - squeak-through-2
+
+    # Parallel rollout instances
+    factorio_instances:
+      - name: ai1
+        save_name: aiworld-1.zip
+        seed: "0627218724"
+        port: 34197
+        rcon_port: 27015
+      - name: ai2
+        save_name: aiworld-2.zip
+        seed: "13371337"
+        port: 34198
+        rcon_port: 27016
+
+  roles:
+    - role: roles/factorio_server

@@ -1,0 +1,40 @@
+---
+factorio_version: "2.0.60"
+install_dir: "/opt/factorio"
+data_dir: "/srv/factorio"
+factorio_user: "factorio"
+factorio_group: "factorio"
+factorio_seed: "0627218724"
+
+factorio_tarball_local: ""
+
+# Base ports for instances (ai1 -> base, ai2 -> base+1, ...)
+game_port_base: 34197
+rcon_port_base: 27015
+
+# Optional static mod list (kept for future), but we’ll prefer scanning zips on disk
+mods_enabled: []
+
+# Auto-download via Mod Portal (still supported; off by default)
+download_mods: false
+prefer_factorio_major: "2."
+
+# New: deploy *.zip from controller (we require local Factorio-AI-agent_*.zip)
+use_local_mod_zips: false
+mods_local_dir: "{{ playbook_dir }}/files/mods"
+require_agent_mod_local: true  # fail if Factorio-AI-agent_*.zip missing when use_local_mod_zips=true
+
+# Firewall (optional)
+ufw_manage: false              # if true, add per-instance rules (no auto-enable)
+ufw_enable: false              # if true, ensure ufw state=enabled
+ufw_default_policy: "allow"    # leave traffic default open unless you opt-in
+
+# Logrotate (optional)
+logrotate_manage: false
+logrotate_rotate: 8
+logrotate_period: weekly
+
+# Instances
+factorio_instances:
+  - name: default
+    save_name: aiworld.zip
